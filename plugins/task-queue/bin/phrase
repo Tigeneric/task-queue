@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""One short line a session's character says, drawn by the local Apple Foundation Models CLI.
+
+  phrase NAME        print one line (2–6 words) or nothing
+
+The companions list shows it above the dots between a session's name and its sign. The model runs
+on this machine (`fm`, FM_BIN overrides the path); nothing leaves it. Any failure — no fm, a
+guardrail refusal, a timeout, a line too long — prints nothing and exits 0: the pane keeps the
+previous line or shows only the dots.
+"""
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+
+FM = os.environ.get("FM_BIN", "fm")
+# English: the model's lines come out more varied there, and some prompts that mention race or
+# role trip its guardrails, so it is asked for a friendly saying with a theme drawn at random —
+# without one it repeats itself ("Strength in shadows" for four characters in a row).
+INSTRUCTIONS = ("You write a short saying a friendly character from The Elder Scrolls might say. "
+                "Reply with only the saying: 2 to 6 words, English, no quotes, no markdown.")
+THEMES = ("Morrowind ash storms", "the Hist trees of Black Marsh", "the moons Masser and Secunda",
+          "Khajiit caravans", "the College of Winterhold", "a tavern in Whiterun", "the Thieves Guild",
+          "dragons over Skyrim", "the roads of Cyrodiil", "an Elder Scroll", "the Mages Guild",
+          "a long journey", "the Imperial City", "Solstheim", "Dwemer ruins", "a quiet night by the fire")
+# A character's race comes from tabfolk's TES roster (names by race); the prompt names it and draws
+# a theme of that people's world. Saying "race" or "voice" outright trips fm's guardrails; naming
+# the people ("Derkeethus, an Argonian") does not.
+# Without tabfolk the line is drawn from a theme alone. PHRASE_RACES, then TABFOLK_ROOT, override.
+TABFOLK = os.environ.get("TABFOLK_ROOT") or os.path.expanduser("~/projects/tabfolk")
+RACES = os.environ.get("PHRASE_RACES", os.path.join(TABFOLK, "themes", "tes", "races.json"))
+PEOPLE = {"altmer": "an Altmer", "bosmer": "a Bosmer", "dunmer": "a Dunmer", "nord": "a Nord",
+          "imperial": "an Imperial", "breton": "a Breton", "redguard": "a Redguard", "khajiit": "a Khajiit",
+          "argonian": "an Argonian", "orc": "an Orc"}
+RACE_THEMES = {
+    "altmer": ("the Summerset Isles", "old Aldmeri lore", "a quiet library"),
+    "bosmer": ("the forests of Valenwood", "the Green Pact", "a hunter's trail"),
+    "dunmer": ("Morrowind ash storms", "the ancestors", "Vivec City"),
+    "nord": ("Skyrim snow", "mead and song", "Sovngarde"),
+    "imperial": ("the roads of Cyrodiil", "the Imperial City", "the Legion's march"),
+    "breton": ("High Rock castles", "the Mages Guild", "Wayrest harbour"),
+    "redguard": ("Hammerfell desert winds", "the sword's way", "Sentinel's markets"),
+    "khajiit": ("the moons Masser and Secunda", "Khajiit caravans", "moon sugar"),
+    "argonian": ("the Hist trees of Black Marsh", "swamp waters", "the marshes at dawn"),
+    "orc": ("an Orsinium stronghold", "the forge", "Malacath's code"),
+}
+MAX_WORDS = 6
+MAX_CHARS = 48
+
+
+def clean(text):
+    for line in text.splitlines():
+        line = re.sub(r"^[\s>*•\-–—]+", "", line).strip()
+        line = line.replace("**", "").replace("__", "").strip()
+        line = line.strip("«»\"“”„'`").strip().rstrip(".").strip("«»\"“”„'`").strip()
+        if line:
+            return line
+    return ""
+
+
+def prompt(name):
+    race = race_of(name)
+    if race in PEOPLE:
+        return f"Character name: {name}, {PEOPLE[race]}. Theme: {random.choice(RACE_THEMES[race])}"
+    return f"Character name: {name}. Theme: {random.choice(THEMES)}"
+
+
+def race_of(name):
+    """The roster race whose names include this name, or its first word ("Marcus Varro")."""
+    try:
+        roster = json.load(open(RACES))
+    except (OSError, ValueError):
+        return None
+    wanted = {name, name.split()[0]} if name.split() else {name}
+    for race, data in roster.items():
+        names = {n for group in (data.get("first") or {}).values() for n in group}
+        if wanted & names:
+            return race
+    return None
+
+
+def main(argv):
+    if len(argv) != 1:
+        return 0
+    try:
+        r = subprocess.run([FM, "respond", "--no-stream", "-i", INSTRUCTIONS,
+                            prompt(argv[0])],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if r.returncode != 0:
+        return 0
+    line = clean(r.stdout)
+    if line and len(line.split()) <= MAX_WORDS and len(line) <= MAX_CHARS and not line.lower().startswith("error"):
+        print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception:
+        sys.exit(0)

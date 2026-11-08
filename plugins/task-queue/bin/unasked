@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Tell whether this turn ended on a question to the owner that was not put into the task queue.
+
+  unasked --transcript PATH --file QUEUE [--stop-hook-active] [--lang ru|en]
+
+Exit 1 with one line on stdout when the last assistant message ends on a question and no
+`queue ask`/`queue answer` ran in this turn; exit 0 silently otherwise. Called by a Stop hook,
+so every failure to read the transcript or the queue is silence: the hook must never break a turn.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+# The line by the plugin's `language` option (--lang); ru is the default.
+LINES = {
+    "ru": "вопрос оператору не в очереди: queue ask … --blocks …",
+    "en": "question to the owner not in the queue: queue ask … --blocks …",
+}
+TAIL = 8 * 1024 * 1024
+QUEUE_CLI = re.compile(r"bin/queue(?![\w-])")
+QUEUE_VERB = re.compile(r"(?<![\w-])(ask|answer)(?![\w-])")
+FENCED = re.compile(r"```.*?(```|\Z)", re.S)
+INLINE = re.compile(r"`[^`\n]*`")
+# Not questions to the owner, measured on 34 hand-labelled turn endings (2026-10-20): a pointer to
+# a queue question ("?1") and a quoted question («…?», "…?") made 10 of the rule's 12 false positives.
+QUEUE_REF = re.compile(r"\?\d")
+QUOTED = re.compile(r"«[^»\n]*»|\"[^\"\n]*\"|“[^”\n]*”")
+
+
+class Unreadable(Exception):
+    pass
+
+
+def has_tasks(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            q = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(q, dict) and isinstance(q.get("tasks"), list) and bool(q["tasks"])
+
+
+def entries(path, tail):
+    """The transcript's entries, the last `tail` bytes of it or all of it (tail=None)."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            start = max(0, size - tail) if tail else 0
+            f.seek(start)
+            lines = f.read().decode("utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as e:
+        raise Unreadable from e
+    if start:
+        lines = lines[1:]  # cut mid-line by the seek
+    out = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError as err:
+            raise Unreadable from err
+        if not isinstance(e, dict):
+            raise Unreadable
+        out.append(e)
+    return out
+
+
+def content(e):
+    c = (e.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return [{"type": "text", "text": c}]
+    return [b for b in c if isinstance(b, dict)] if isinstance(c, list) else []
+
+
+def starts_turn(e):
+    """A prompt: user text on the main thread. Text the harness attaches to a tool call (a skill's
+    body after the Skill tool) or to a prompt already counted is part of the turn, not its start."""
+    if e.get("type") != "user" or e.get("isSidechain") or e.get("sourceToolUseID") or e.get("turnCompanion"):
+        return False
+    return any(b.get("type") == "text" for b in content(e))
+
+
+def this_turn(path):
+    for tail in (TAIL, None):
+        es = entries(path, tail)
+        start = next((i for i in range(len(es) - 1, -1, -1) if starts_turn(es[i])), None)
+        if start is not None:
+            return es[start + 1:]
+        if tail is None or os.path.getsize(path) <= tail:
+            return None
+    return None
+
+
+def asked(turn):
+    for e in turn:
+        if e.get("type") != "assistant" or e.get("isSidechain"):
+            continue
+        for b in content(e):
+            if b.get("type") != "tool_use" or b.get("name") != "Bash":
+                continue
+            cmd = (b.get("input") or {}).get("command")
+            if isinstance(cmd, str) and QUEUE_CLI.search(cmd) and QUEUE_VERB.search(cmd):
+                return True
+    return False
+
+
+def last_text(turn):
+    """The text of the last assistant message. The transcript writes one content block per entry,
+    so the message is every entry that shares the last one's message id."""
+    mine = [e for e in turn if e.get("type") == "assistant" and not e.get("isSidechain")]
+    if not mine:
+        return ""
+    mid = (mine[-1].get("message") or {}).get("id")
+    parts = [e for e in mine if mid is not None and (e.get("message") or {}).get("id") == mid] or mine[-1:]
+    return "\n".join(b.get("text", "") for e in parts for b in content(e)
+                     if b.get("type") == "text" and isinstance(b.get("text"), str))
+
+
+def ends_on_question(text):
+    text = FENCED.sub("", text)
+    paragraphs = [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if not paragraphs:
+        return False
+    kept = [line for line in INLINE.sub("", paragraphs[-1]).splitlines() if not line.lstrip().startswith("> ")]
+    return "?" in QUOTED.sub("", QUEUE_REF.sub("", "\n".join(kept)))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--transcript", required=True)
+    p.add_argument("--file", required=True)
+    p.add_argument("--stop-hook-active", action="store_true")
+    # Stop can fire before the final text reaches the transcript; the hook then passes the
+    # event's last_assistant_message here. The turn and its queue calls are still read from
+    # the transcript, which holds them before the final text.
+    p.add_argument("--last-message-stdin", action="store_true")
+    p.add_argument("--lang", choices=sorted(LINES), default="en")
+    try:
+        args = p.parse_args()
+    except SystemExit:
+        return 0  # argparse exits 2 on a bad call, and exit 2 from a Stop hook blocks the turn
+    if args.stop_hook_active or not has_tasks(args.file):
+        return 0
+    try:
+        turn = this_turn(args.transcript)
+    except Unreadable:
+        return 0
+    given = sys.stdin.read() if args.last_message_stdin else ""
+    if turn is None or asked(turn) or not ends_on_question(given or last_text(turn)):
+        return 0
+    print(LINES[args.lang])
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        sys.exit(0)

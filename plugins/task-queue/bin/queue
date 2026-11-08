@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Keep this session's task queue, the file the /queue pane draws.
+
+One short call per change, so Claude never rewrites the whole JSON:
+
+  queue new TITLE [--purpose TEXT]    start the queue (on an existing one: retitle)
+  queue add TASK [--owner WHO] [--status STATUS]   prints #n
+  queue start|done|wait|fail N...     set the status of tasks
+  queue set N [--task TEXT] [--owner WHO]
+  queue phase|note|purpose|title TEXT ("" clears phase, note, purpose)
+  queue ask QUESTION [--blocks N...]  prints ?k, the number the pane shows
+  queue answer K...                   remove answered questions
+  queue coordinator on|off            this queue's session watches the others for stalls (Stop hook)
+  queue compact-for NAME TEXT [--by WHO]   write a cold session's /compact argument for it
+  queue show
+
+The file is ~/.claude/task-queues/$CLAUDE_CODE_SESSION_ID.json unless --file names one.
+--lang en writes the default owner and the warnings in English (ru, the default, in Russian).
+"""
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+VERBS = {"start": "active", "done": "done", "wait": "waiting", "fail": "failed"}
+STATUSES = sorted(set(VERBS.values()))
+CLEARABLE = ("phase", "note", "purpose")
+
+
+# bin/stalls holds the one rule for a session's bare name, the key the pane and contexts use.
+STALLS = SourceFileLoader("stalls", os.path.join(os.path.dirname(os.path.realpath(__file__)), "stalls")).load_module()
+
+
+# The words the CLI writes for the person, by the plugin's `language` option (--lang). Owner
+# words are read in both languages whichever is chosen; only what is written follows it.
+WORDS = {
+    "ru": {"me": "я", "coordinator": "координатор", "warn": "queue: warning: «{owner}» is not one session's name; the pane will not show it as a session "
+                              "(write `сессия <name>`, one session per task)"},
+    "en": {"me": "me", "coordinator": "coordinator", "warn": 'queue: warning: "{owner}" is not one session\'s name; the pane will not show it as a session '
+                              "(write `session <name>`, one session per task)"},
+}
+
+
+def warn_owner(owner, lang="ru"):
+    """An `сессия …` owner that is not one roster name (`сессия X → оператор`, `сессия «A» + «B»`)
+    is silently no session in the pane: say so while it is written. A trailing badge is fine."""
+    name = STALLS.session_name(owner)
+    if name is None:
+        return
+    body = owner.strip()[len(STALLS.session_prefix(owner)):].strip()
+    while body and STALLS.bare(body[-1]) == "":
+        body = body[:-1]  # the roster badge (Ada🎻) trails the name
+    if not name or STALLS.bare(body) != body.strip():
+        print(WORDS[lang]["warn"].format(owner=owner), file=sys.stderr)
+
+
+def fail(message):
+    print(f"queue: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def default_path():
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session:
+        fail("no CLAUDE_CODE_SESSION_ID; pass --file")
+    return Path.home() / ".claude" / "task-queues" / f"{session}.json"
+
+
+def save(path, q):
+    q["updated"] = time.strftime("%H:%M")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Written aside and moved in, so the pane, which reads every 3 s, never sees half a file.
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".queue-")
+    with os.fdopen(fd, "w") as out:
+        json.dump(q, out, ensure_ascii=False, indent=2)
+        out.write("\n")
+    os.replace(tmp, path)
+
+
+def task(q, n):
+    found = next((t for t in q["tasks"] if t["n"] == n), None)
+    if found is None:
+        fail(f"no task #{n}")
+    return found
+
+
+def parse(argv):
+    p = argparse.ArgumentParser(prog="queue")
+    p.add_argument("--file", type=Path)
+    p.add_argument("--lang", choices=sorted(WORDS), default="en")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    one = sub.add_parser("new")
+    one.add_argument("title")
+    one.add_argument("--purpose")
+    one = sub.add_parser("add")
+    one.add_argument("task")
+    one.add_argument("--owner")
+    one.add_argument("--status", default="waiting", choices=STATUSES)
+    for verb in (*VERBS, "park", "unpark"):
+        sub.add_parser(verb).add_argument("n", type=int, nargs="+")
+    one = sub.add_parser("set")
+    one.add_argument("n", type=int)
+    one.add_argument("--task")
+    one.add_argument("--owner")
+    for field in (*CLEARABLE, "title"):
+        sub.add_parser(field).add_argument("text")
+    one = sub.add_parser("ask")
+    one.add_argument("question")
+    one.add_argument("--blocks", type=int, nargs="+")
+    sub.add_parser("answer").add_argument("k", type=int, nargs="+")
+    one = sub.add_parser("why")
+    one.add_argument("name")
+    one.add_argument("text")
+    sub.add_parser("coordinator").add_argument("mode", choices=("on", "off"))
+    one = sub.add_parser("compact-for")
+    one.add_argument("name")
+    one.add_argument("text")
+    one.add_argument("--by")
+    sub.add_parser("show")
+    return p.parse_args(argv)
+
+
+def main(argv):
+    args = parse(argv)
+    path = args.file or default_path()
+
+    if args.cmd == "compact-for":
+        # A cold session cannot write its own compact-ready file without being woken, which is
+        # what the compact is meant to spare; its coordinator writes it instead. The first line
+        # names the author, so the pane can tell this from a file the session wrote itself.
+        ready = Path.home() / ".claude/task-queues/compact-ready" / f"{STALLS.bare(args.name)}.txt"
+        ready.parent.mkdir(parents=True, exist_ok=True)
+        ready.write_text(f"<!-- by {args.by or WORDS[args.lang]['coordinator']} -->\n{args.text.strip()}\n", encoding="utf-8")
+        print(ready)
+        return
+
+    if args.cmd == "new":
+        q = json.loads(path.read_text()) if path.exists() else {"tasks": []}
+        q["title"] = args.title
+        if args.purpose is not None:
+            q["purpose"] = args.purpose
+        save(path, q)
+        return
+    if not path.exists():
+        fail(f"no queue at {path}; start one with `queue new TITLE`")
+    q = json.loads(path.read_text())
+    q.setdefault("tasks", [])
+    # A question written by hand as a plain string is its text.
+    if "questions" in q:
+        q["questions"] = [{"q": one} if isinstance(one, str) else one for one in q["questions"]]
+
+    if args.cmd == "show":
+        for key in ("title", "phase"):
+            if q.get(key):
+                print(q[key])
+        if q.get("coordinator") is True:
+            print("coordinator: on")
+        for i, one in enumerate(q.get("questions", []), 1):
+            print(f"?{i} {one['q']}")
+        for t in q["tasks"]:
+            print(f"#{t['n']} {t['status']} {t['owner']}: {t['task']}")
+        return
+
+    if args.cmd == "add":
+        n = max((t["n"] for t in q["tasks"]), default=0) + 1
+        owner = WORDS[args.lang]["me"] if args.owner is None else args.owner
+        warn_owner(owner, args.lang)
+        q["tasks"].append({"n": n, "task": args.task, "owner": owner, "status": args.status})
+        print(f"#{n}")
+    elif args.cmd in VERBS:
+        for n in args.n:
+            t = task(q, n)
+            t["status"] = VERBS[args.cmd]
+            if t["status"] in ("done", "failed"):
+                t.pop("parked", None)
+    elif args.cmd in ("park", "unpark"):
+        # Parked: the task waits on purpose, its session cold and the owner chose not to wake it.
+        for n in args.n:
+            t = task(q, n)
+            if args.cmd == "park":
+                t["parked"] = True
+            else:
+                t.pop("parked", None)
+    elif args.cmd == "set":
+        t = task(q, args.n)
+        if args.task is not None:
+            t["task"] = args.task
+        if args.owner is not None:
+            warn_owner(args.owner, args.lang)
+            t["owner"] = args.owner
+    elif args.cmd in CLEARABLE and args.text == "":
+        q.pop(args.cmd, None)
+    elif args.cmd in (*CLEARABLE, "title"):
+        q[args.cmd] = args.text
+    elif args.cmd == "ask":
+        one = {"q": args.question}
+        if args.blocks:
+            one["blocks"] = args.blocks
+        q.setdefault("questions", []).append(one)
+        print(f"?{len(q['questions'])}")
+    elif args.cmd == "why":
+        # Why a companion session is idle (free, cold, parked): shown under its row in the
+        # cold · free box. Keyed by the bare name, as the pane keys sessions; "" clears it.
+        name = STALLS.bare(args.name)
+        why = q.setdefault("why", {})
+        if args.text:
+            why[name] = args.text
+        else:
+            why.pop(name, None)
+        if not why:
+            del q["why"]
+    elif args.cmd == "coordinator":
+        # Coordinator mode: the plugin's Stop hook runs bin/stalls --coordinator for this queue.
+        # Absent means off, so a queue written before the key existed reads as it always did.
+        if args.mode == "on":
+            q["coordinator"] = True
+        else:
+            q.pop("coordinator", None)
+    elif args.cmd == "answer":
+        questions = q.get("questions", [])
+        for k in args.k:
+            if not 1 <= k <= len(questions):
+                fail(f"no question ?{k}")
+        q["questions"] = [one for i, one in enumerate(questions, 1) if i not in args.k]
+        if not q["questions"]:
+            del q["questions"]
+
+    save(path, q)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

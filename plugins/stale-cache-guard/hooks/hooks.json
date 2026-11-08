@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "python3 -I \"${CLAUDE_PLUGIN_ROOT}/bin/stale-cache-guard.py\"" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "SendMessage", "hooks": [{ "type": "command", "command": "python3 -I \"${CLAUDE_PLUGIN_ROOT}/bin/stale-cache-guard.py\"" }] }
+    ]
+  }
+}

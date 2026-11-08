@@ -1,0 +1,12 @@
+**/.claude-plugin/types/
+__pycache__/
+*.pyc
+.DS_Store
+.claude/worktrees/
+
+# The private half of the project lives in a sibling repository and is
+# attached by a symlink. No trailing slash on purpose: `.local/` does not
+# match a symlink, git would start tracking it, and the link would end up in
+# the public repository dangling for everyone who clones it.
+.local
+CLAUDE.md

@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Print how full each live Claude session's context is, as JSON {name: {tokens, pct}}.
+
+Reads ~/.claude/sessions/<pid>.json for name, session id and cwd, then the tail of that
+session's transcript for the last assistant turn's input tokens (fresh + cache read +
+cache written). The window is taken as 1,000,000 tokens (the 1M models every session here
+runs); a session past 200,000 cannot be on a 200k window, so the guess never under-reads.
+"""
+import json, os, re, sys, glob, subprocess
+from importlib.machinery import SourceFileLoader
+
+HOME = os.path.expanduser("~")
+WINDOW = int(os.environ.get("QUEUE_CONTEXT_WINDOW", "1000000"))
+TAIL = 3 * 1024 * 1024
+READY = f"{HOME}/.claude/task-queues/compact-ready"
+# Whether a session's cache has expired is decided by the stale-cache guard, the one place
+# that holds its thresholds; without it no session is marked cold. It is the sibling plugin in
+# this marketplace: beside this one in the repository (plugins/stale-cache-guard), and once
+# installed, where each plugin is cached as <marketplace>/<plugin>/<version>/, two levels up
+# under its newest version. QUEUE_STALE_GUARD overrides. `contexts --guard` prints the path
+# found (exit 1 when there is none), so the pane asks here instead of keeping a copy of the rule.
+def find_guard():
+    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    installed = sorted(glob.glob(os.path.join(root, "..", "..", "stale-cache-guard", "*", "bin", "stale-cache-guard.py")),
+                       key=lambda p: [int(x) for x in re.findall(r"\d+", p.split(os.sep)[-3])], reverse=True)
+    for path in (os.environ.get("QUEUE_STALE_GUARD"),
+                 os.path.join(root, "..", "stale-cache-guard", "bin", "stale-cache-guard.py"),
+                 *installed):
+        if path and os.path.isfile(path):
+            return os.path.normpath(path)
+    return None
+
+
+GUARD = find_guard()
+if "--guard" in sys.argv:
+    print(GUARD or "", end="\n" if GUARD else "")
+    sys.exit(0 if GUARD else 1)
+# bin/stalls holds the stall rule and the one rule for a session's bare name.
+STALLS = SourceFileLoader("stalls", os.path.join(os.path.dirname(os.path.realpath(__file__)), "stalls")).load_module()
+
+
+def queue_names():
+    """Bare names of the sessions the queue (--queue) holds tasks of; None without --queue."""
+    if "--queue" not in sys.argv:
+        return None
+    try:
+        q = json.load(open(sys.argv[sys.argv.index("--queue") + 1]))
+    except (OSError, ValueError, IndexError):
+        return None
+    names = set()
+    for t in q.get("tasks", []):
+        name = STALLS.session_name(t.get("owner", ""))
+        if name is not None:
+            names.add(name)
+    return names
+
+
+ONLY = queue_names()
+
+
+def guard_status():
+    if not GUARD:
+        return {}
+    try:
+        r = subprocess.run([sys.executable, "-I", GUARD, "--status", *sorted(ONLY or [])], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=15)
+        return json.loads(r.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
+        return {}
+
+
+def tail_lines(path):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - TAIL))
+            return f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+
+
+def last_usage(lines):
+    for line in reversed(lines):
+        if '"subtype":"compact_boundary"' in line:
+            return 0  # compacted since the last call: the next one starts from the summary
+        if '"type":"assistant"' not in line:
+            continue
+        try:
+            u = json.loads(line)["message"]["usage"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        return u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+    return None
+
+
+def last_compact(lines):
+    """When the newest compact_boundary in the tail was written (epoch seconds), or None."""
+    for line in reversed(lines):
+        if '"subtype":"compact_boundary"' not in line:
+            continue
+        try:
+            return STALLS.stamp(json.loads(line))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None
+    return None
+
+
+# --queue QUEUE: also mark sessions that hold a live task there and have stopped (bin/stalls,
+# the one place with that rule).
+def stalled_names():
+    if "--queue" not in sys.argv:
+        return set()
+    try:
+        import time
+        return set(STALLS.stalls(json.load(open(sys.argv[sys.argv.index("--queue") + 1])), time.time()))
+    except Exception:
+        return set()
+
+
+out = {}
+cold = guard_status()
+stalled = stalled_names()
+for meta in glob.glob(f"{HOME}/.claude/sessions/*.json"):
+    try:
+        s = json.load(open(meta))
+    except (OSError, ValueError):
+        continue
+    name, sid, cwd = s.get("name"), s.get("sessionId"), s.get("cwd")
+    if not (name and sid and cwd):
+        continue
+    bare = STALLS.bare(name)
+    if ONLY is not None and bare not in ONLY:
+        continue  # the pane draws only sessions its queue knows; reading the rest is waste
+    lines = tail_lines(STALLS.transcript(f"{HOME}/.claude/projects", cwd, sid))
+    tokens = last_usage(lines) if lines is not None else None
+    if tokens is None:
+        continue
+    entry = {"tokens": tokens, "pct": round(100 * tokens / WINDOW)}
+    # A session at a clean point writes the /compact argument it wants to READY/<name>.txt;
+    # the file's presence is the "ready" mark. A compact newer than the file has used it: the
+    # file is removed here, since a session told to remove it itself did not, twice in a day.
+    ready = f"{READY}/{bare}.txt"
+    compacted = last_compact(lines)
+    if compacted is not None:
+        try:
+            if os.path.getmtime(ready) < compacted:
+                os.unlink(ready)
+        except OSError:
+            pass
+    if os.path.isfile(ready):
+        try:
+            text = open(ready, encoding="utf-8").read().strip()
+        except OSError:
+            text = None
+        if text is not None:
+            # `queue compact-for` writes for a cold session and names itself on the first line.
+            by = re.match(r"<!-- by (.+?) -->\n?", text)
+            if by:
+                entry["compact_by"] = by.group(1)
+                text = text[by.end():].strip()
+            entry["compact"] = text
+    guard = cold.get(bare, {})
+    if "idle_s" in guard:
+        entry["idle_s"] = guard["idle_s"]
+    if guard.get("cold"):
+        entry["cold"] = True
+        if guard.get("allowed"):
+            entry["allowed"] = True
+    if bare in stalled:
+        entry["stalled"] = True
+    out[bare] = entry
+json.dump(out, sys.stdout, ensure_ascii=False)

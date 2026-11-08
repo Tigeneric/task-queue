@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Whether this session owes a compact-ready file: exit 1 and one line when it does, else exit 0.
+
+The pane lists a session for /compact past COMPACT_AT percent, but shows it ready (✓ and the
+button that drafts `/compact <text>` into its prompt) only when the session has written its
+/compact argument to compact-ready/<bare name>.txt, and nothing else tells a session to write it.
+
+Used by the Stop hook. Silent on the second Stop of a turn, below the threshold, when the file
+exists, when the session's name is unknown, and on any error. It nudges once per NUDGE_STEP
+percent of growth, so a session that cannot reach a clean point yet is not stopped every turn.
+
+    compactready --transcript T --session-id SID [--stop-hook-active]
+                 [--sessions-dir D] [--ready-dir D]
+"""
+import argparse
+import json
+import os
+import sys
+from importlib.machinery import SourceFileLoader
+
+HOME = os.path.expanduser("~")
+HERE = os.path.dirname(os.path.realpath(__file__))
+STALLS = SourceFileLoader("stalls", os.path.join(HERE, "stalls")).load_module()
+WINDOW = int(os.environ.get("QUEUE_CONTEXT_WINDOW", "1000000"))
+COMPACT_AT = 80
+NUDGE_STEP = 5
+TAIL = 3 * 1024 * 1024
+# The line, by the plugin's `language` option (--lang).
+LINES = {
+    "ru": ("контекст {pct} %: в ближайшей чистой точке (нет живых субагентов и фоновых оболочек, всё закоммичено, "
+           "заметка для продолжения записана) запиши аргумент для /compact в {path} — по нему панель покажет ✓"),
+    "en": ("context {pct} %: at the next clean point (no live subagents or background shells, everything committed, "
+           "a resume note written) write the /compact argument to {path} — the pane shows ✓ by it"),
+}
+
+
+def own_name(sessions_dir, sid):
+    try:
+        names = os.listdir(sessions_dir)
+    except OSError:
+        return None
+    for entry in names:
+        if not entry.endswith(".json"):
+            continue
+        try:
+            meta = json.load(open(os.path.join(sessions_dir, entry)))
+        except (OSError, ValueError):
+            continue
+        if meta.get("sessionId") == sid and meta.get("name"):
+            return STALLS.bare(meta["name"])
+    return None
+
+
+def tokens(transcript):
+    try:
+        size = os.path.getsize(transcript)
+        with open(transcript, "rb") as f:
+            f.seek(max(0, size - TAIL))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    # Parsed, not matched as text: a matched `"type":"assistant"` misses the same line written with
+    # a space after the colon, and the test fixture writes it that way.
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("subtype") == "compact_boundary":
+            return 0
+        if entry.get("type") != "assistant":
+            continue
+        u = (entry.get("message") or {}).get("usage")
+        if not isinstance(u, dict):
+            continue
+        return u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+    return None
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--transcript", required=True)
+    p.add_argument("--session-id", required=True)
+    p.add_argument("--stop-hook-active", action="store_true")
+    p.add_argument("--sessions-dir", default=f"{HOME}/.claude/sessions")
+    p.add_argument("--ready-dir", default=f"{HOME}/.claude/task-queues/compact-ready")
+    p.add_argument("--lang", choices=sorted(LINES), default="en")
+    a = p.parse_args()
+    if a.stop_hook_active:
+        return 0
+    used = tokens(a.transcript)
+    if not used:
+        return 0
+    pct = round(100 * used / WINDOW)
+    if pct < COMPACT_AT:
+        return 0
+    name = own_name(a.sessions_dir, a.session_id)
+    if not name:
+        return 0
+    ready = os.path.join(a.ready_dir, f"{name}.txt")
+    if os.path.isfile(ready):
+        return 0
+    # Once per NUDGE_STEP percent: the last nudged level lives beside the ready files.
+    mark = os.path.join(a.ready_dir, f".nudged-{name}")
+    try:
+        last = int(open(mark).read().strip())
+    except (OSError, ValueError):
+        last = -NUDGE_STEP
+    if pct < last + NUDGE_STEP:
+        return 0
+    try:
+        os.makedirs(a.ready_dir, exist_ok=True)
+        with open(mark, "w") as f:
+            f.write(str(pct))
+    except OSError:
+        pass
+    print(LINES[a.lang].format(pct=pct, path=ready.replace(HOME, "~", 1)))
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:  # a failing check never holds a turn
+        sys.exit(0)

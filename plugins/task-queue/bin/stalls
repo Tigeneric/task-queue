@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""Find peer sessions that have stopped working while the queue holds work for them.
+
+Idle means the session's transcript shows its last turn ended (no tool running, no prompt
+being answered) between MIN_IDLE and MAX_IDLE seconds ago. The upper bound is the prompt
+cache's hour: a nudge inside it is cheap, after it the stale-cache guard takes over and asks
+the owner.
+
+A turn that ended on background work is not idle: the session is waiting for it to report.
+Background work is a launch since the last genuine prompt (user text on the main thread; a
+tool_result, a sidechain, an entry carrying sourceToolUseID or turnCompanion, and a
+<task-notification> do not start a turn) whose id has no later completion. A launch is a
+tool_result whose toolUseResult carries backgroundTaskId (Bash run_in_background), isAsync with
+agentId (a background Agent) or taskId with timeoutMs (a Monitor); a completion is a
+<task-notification> naming that <task-id> with a <status>, in a user entry, a queued_command
+attachment or a queue-operation. A Monitor's event notifications carry no <status>, so an armed
+Monitor stays pending. A launch older than MAX_IDLE no longer holds the session busy, so a job
+that was forgotten or killed without a notification cannot hide a stall for ever.
+
+An idle session is reported in one of two kinds:
+
+  stalled  it has a task in progress (`сессия <name>` or `session <name>`, status active), not parked and not
+           waiting on an open question:   `Name: 20 min idle with #5`
+  next     it has no such task, but has waiting tasks of its own, not parked and not blocked
+           by an open question:           `Name: 20 min idle, next: #6, #7`
+
+A parked task is a deliberate "not now" and counts for neither. A reason recorded with
+`queue why NAME TEXT` silences nothing: it is appended to the line as ` — why: TEXT`.
+
+  stalls --file QUEUE            print reported sessions, one per line
+  stalls --file QUEUE --json     the same as JSON {name: {kind, idle_s, tasks, since[, why]}}
+  stalls --file QUEUE --wait     poll every 60 s; print and exit on the first new report
+  stalls --file QUEUE --coordinator
+                                 once, for the plugin's Stop hook: only when the queue has
+                                 coordinator mode on (`queue coordinator on`); print the reports
+                                 not yet told and exit 1, else exit 0 silently (any error too)
+
+`--wait` reports each kind once per idle turn, keyed apart: a session reported as next and
+then found stalled in the same turn (or the reverse) is reported again.
+
+Built for the coordinator's Monitor: `--wait` costs nothing while everyone works.
+
+`--coordinator` remembers what it told in `.<queue file name>.coordinator-reported.json` beside the
+queue: the fingerprint of each report (session, kind, task numbers and the moment the idle turn
+ended, not the minutes), kept while that report is still found. A stall that clears and recurs, even
+between two coordinator stops, or a new task idling, reports again.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+SESSIONS = os.environ.get("STALLS_SESSIONS", f"{HOME}/.claude/sessions")
+PROJECTS = os.environ.get("STALLS_PROJECTS", f"{HOME}/.claude/projects")
+STATE = os.environ.get("STALLS_STATE", f"{HOME}/.claude/state/stalls-reported.json")
+MIN_IDLE = int(os.environ.get("STALLS_MIN_IDLE", "900"))      # 15 min
+MAX_IDLE = int(os.environ.get("STALLS_MAX_IDLE", "3300"))     # 55 min, inside the cache's hour
+TAIL = 2 * 1024 * 1024
+
+
+def bare(name):
+    """A session's name as every reader keys it (the pane's sessionName too): letters, digits,
+    space, ' and -, so a roster badge (`Ada🎻`) is dropped."""
+    return "".join(ch for ch in name if ch.isalnum() or ch in " '-").strip()
+
+
+def transcript(projects, cwd, sid):
+    """A session's transcript: under the slug of its cwd, or, for a session that has moved since it
+    started (the transcript stays under the first directory's slug), wherever its id is."""
+    path = os.path.join(projects, cwd.replace("/", "-").replace(".", "-"), sid + ".jsonl")
+    if os.path.isfile(path):
+        return path
+    found = glob.glob(os.path.join(projects, "*", glob.escape(sid) + ".jsonl"))
+    return found[0] if found else path
+
+
+def sessions():
+    """{bare name: transcript path} for every live session."""
+    out = {}
+    for meta in glob.glob(os.path.join(SESSIONS, "*.json")):
+        try:
+            s = json.load(open(meta))
+        except (OSError, ValueError):
+            continue
+        if s.get("name") and s.get("sessionId") and s.get("cwd"):
+            out[bare(s["name"])] = transcript(PROJECTS, s["cwd"], s["sessionId"])
+    return out
+
+
+NOTE = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
+TASK_ID = re.compile(r"<task-id>([^<]+)</task-id>")
+
+
+def stamp(e):
+    return datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00")).timestamp()
+
+
+def texts(e):
+    """The text blocks of an entry's message (a string content is one block); never tool_results."""
+    c = (e.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return [c]
+    return [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"] \
+        if isinstance(c, list) else []
+
+
+def completions(e):
+    """Task ids this entry reports finished: a <task-notification> with a <status>."""
+    if e.get("isSidechain"):
+        return set()
+    if e.get("type") == "user":
+        bodies = texts(e)
+    elif e.get("type") == "attachment":
+        bodies = [(e.get("attachment") or {}).get("prompt")]
+    elif e.get("type") == "queue-operation":
+        bodies = [e.get("content")]
+    else:
+        return set()
+    out = set()
+    for body in bodies:
+        for note in NOTE.findall(body) if isinstance(body, str) else ():
+            m = TASK_ID.search(note)
+            if m and "<status>" in note:
+                out.add(m.group(1).strip())
+    return out
+
+
+def launch(e):
+    """The id of the background work this tool_result started, or None."""
+    r = e.get("toolUseResult")
+    if e.get("type") != "user" or e.get("isSidechain") or not isinstance(r, dict):
+        return None
+    if r.get("backgroundTaskId"):
+        return r["backgroundTaskId"]
+    if r.get("isAsync") and r.get("agentId"):
+        return r["agentId"]
+    if r.get("taskId") and "timeoutMs" in r:
+        return r["taskId"]
+    return None
+
+
+def starts_turn(e):
+    """A genuine prompt: bin/unasked's rule, and a task notification is not one."""
+    if e.get("type") != "user" or e.get("isSidechain") or e.get("sourceToolUseID") or e.get("turnCompanion"):
+        return False
+    if (e.get("origin") or {}).get("kind") == "task-notification":
+        return False
+    ts = texts(e)
+    return bool(ts) and not all(t.lstrip().startswith("<task-notification>") for t in ts)
+
+
+def pending_background(es, now):
+    """True when the turn holds background work launched under MAX_IDLE ago and not yet reported
+    finished. Without a prompt in the tail, the whole tail stands for the turn."""
+    start = next((i for i in range(len(es) - 1, -1, -1) if starts_turn(es[i])), -1)
+    launched, done = {}, set()
+    for e in es[start + 1:]:
+        tid = launch(e)
+        if tid:
+            launched[tid] = stamp(e)
+        done |= completions(e)
+    return any(tid not in done and now - ts <= MAX_IDLE for tid, ts in launched.items())
+
+
+def turn_state(path, now):
+    """(seconds-since-epoch of the last main-thread message, busy). Busy: a tool is running or
+    the model is answering, i.e. the last message is a tool call or a user turn, or the turn
+    left background work running (see the module docstring)."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - TAIL))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    es = []
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and isinstance(d.get("timestamp"), str):
+            es.append(d)
+    for d in reversed(es):
+        if d.get("isSidechain") or d.get("type") not in ("assistant", "user"):
+            continue
+        ts = stamp(d)
+        if d["type"] == "user":
+            return ts, True
+        content = (d.get("message") or {}).get("content") or []
+        calls_tool = any(isinstance(c, dict) and c.get("type") == "tool_use" for c in content)
+        return ts, calls_tool or pending_background(es, now)
+    return None
+
+
+# The owner word for another session, in either language the pane speaks: a queue written in
+# one language reads the same under the other. The English word must end there (`sessions` is
+# not it); the Russian one is read as a prefix, as it always was.
+SESSION_WORDS = ("сессия", "session")
+
+
+def session_prefix(owner):
+    """The session word an owner opens with, as written; None when it opens with no such word."""
+    owner = owner.strip()
+    for word in SESSION_WORDS:
+        head = owner[:len(word)]
+        if head.lower() != word:
+            continue
+        if word.isascii() and owner[len(word):len(word) + 1].isascii() and owner[len(word):len(word) + 1].isalpha():
+            continue
+        return head
+    return None
+
+
+def session_name(owner):
+    """The bare name of a `сессия <name>` / `session <name>` owner; None for any other owner."""
+    owner = owner.strip()
+    prefix = session_prefix(owner)
+    return bare(owner[len(prefix):]) if prefix is not None else None
+
+
+def open_tasks(queue, status):
+    """{bare session name: [n, ...]} of its tasks in `status`, not parked, not blocked by a question."""
+    blocked = {n for q in queue.get("questions", []) if isinstance(q, dict) for n in q.get("blocks", [])}
+    out = {}
+    for t in queue.get("tasks", []):
+        name = session_name(t.get("owner", ""))
+        if not name or t.get("status") != status or t.get("parked") or t["n"] in blocked:
+            continue
+        out.setdefault(name, []).append(t["n"])
+    return out
+
+
+def idle(names, now):
+    """{name: (idle seconds, since)} for those of `names` whose last turn ended inside the window."""
+    out = {}
+    paths = sessions()
+    for name in names:
+        state = turn_state(paths[name], now) if name in paths else None
+        if not state:
+            continue
+        ts, busy = state
+        if not busy and MIN_IDLE <= now - ts <= MAX_IDLE:
+            out[name] = (now - ts, ts)
+    return out
+
+
+def entry(kind, tasks, idle_s, since, queue, name):
+    e = {"kind": kind, "idle_s": round(idle_s), "tasks": tasks, "since": round(since)}
+    why = (queue.get("why") or {}).get(name)
+    if why:
+        e["why"] = why
+    return e
+
+
+def stalls(queue, now):
+    """Stalled sessions only: what bin/contexts marks."""
+    live = open_tasks(queue, "active")
+    return {name: entry("stalled", live[name], s, ts, queue, name) for name, (s, ts) in idle(live, now).items()}
+
+
+def findings(queue, now):
+    """Stalled sessions, plus free ones with waiting work of their own (kind "next")."""
+    found = stalls(queue, now)
+    live = open_tasks(queue, "active")
+    waiting = {name: sorted(ns) for name, ns in open_tasks(queue, "waiting").items() if name not in live}
+    for name, (s, ts) in idle(waiting, now).items():
+        found[name] = entry("next", waiting[name], s, ts, queue, name)
+    return found
+
+
+def report(found):
+    for name, s in sorted(found.items()):
+        tasks = "#" + ", #".join(map(str, s["tasks"]))
+        line = f"{name}: {s['idle_s'] // 60} min idle, next: {tasks}" if s["kind"] == "next" \
+            else f"{name}: {s['idle_s'] // 60} min idle with {tasks}"
+        print(line + (f" — why: {s['why']}" if s.get("why") else ""))
+
+
+def seen_key(name, s):
+    """The dedup key: stalled under the bare name (as before), next apart, so neither silences the other."""
+    return f"next:{name}" if s["kind"] == "next" else name
+
+
+def fingerprint(name, s):
+    """What a report is, without how long it has lasted: one more idle minute is not news. `since`
+    (when the idle turn ended) stays in it, so a stall that cleared and recurred between two
+    coordinator stops is a new report even though nobody saw it clear."""
+    return f"{s['kind']}:{name}:{','.join(map(str, s['tasks']))}:{s['since']}"
+
+
+WATCHER = "watcher:missing"
+
+
+def watcher_running(path):
+    """Whether a `stalls --file <this queue> --wait` is alive: the one thing that wakes a silent
+    coordinator, and the thing that died unnoticed with a reboot. STALLS_PS names a file standing
+    in for `ps` output (tests)."""
+    if os.environ.get("STALLS_PS"):
+        lines = open(os.environ["STALLS_PS"]).read().splitlines()
+    else:
+        lines = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True).stdout.splitlines()
+    want = os.path.realpath(path)
+    for line in lines:
+        argv = line.split()
+        if "--wait" not in argv or not any(os.path.basename(a) == "stalls" for a in argv):
+            continue
+        if any(os.path.realpath(b) == want for a, b in zip(argv, argv[1:]) if a == "--file"):
+            return True
+    return False
+
+
+def coordinator(path, state):
+    """The Stop hook's one-shot run: exit 1 with the untold reports, 0 with nothing to say."""
+    try:
+        queue = json.load(open(path))
+        if not isinstance(queue, dict) or queue.get("coordinator") is not True:
+            return 0
+        found = findings(queue, float(os.environ.get("STALLS_NOW", time.time())))
+        try:
+            told = set(json.load(open(state)))
+        except (OSError, ValueError, TypeError):
+            told = set()
+        now = {fingerprint(n, s): n for n, s in found.items()}
+        new = {n: found[n] for fp, n in now.items() if fp not in told}
+        missing = not watcher_running(path)
+        if missing:
+            now[WATCHER] = None
+        warn = missing and WATCHER not in told
+        # Only what is still found is kept, so a report that cleared is told again when it recurs.
+        if set(now) != told:
+            tmp = state + ".tmp"
+            with open(tmp, "w") as out:
+                json.dump(sorted(now), out)
+            os.replace(tmp, state)
+    except Exception:  # a failing check never holds the coordinator's turn
+        return 0
+    if not new and not warn:
+        return 0
+    report(new)
+    if warn:
+        print(f"watcher: no background `{os.path.abspath(__file__)} --file {path} --wait` is running;"
+              " launch it with run_in_background, so a stretch with no turns of yours is watched too")
+    return 1
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="stalls")
+    p.add_argument("--file", required=True)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--wait", action="store_true")
+    p.add_argument("--coordinator", action="store_true")
+    p.add_argument("--state", help="where --coordinator remembers what it told (default: beside the queue)")
+    a = p.parse_args(argv)
+    if a.coordinator:
+        d, base = os.path.split(os.path.abspath(a.file))
+        return coordinator(a.file, a.state or os.path.join(d, f".{base}.coordinator-reported.json"))
+    now = lambda: float(os.environ.get("STALLS_NOW", time.time()))
+    load = lambda: json.load(open(a.file))
+    if not a.wait:
+        found = findings(load(), now())
+        print(json.dumps(found, ensure_ascii=False)) if a.json else report(found)
+        return 0
+    # Each kind is reported once: the same session idle since the same moment stays quiet.
+    while True:
+        try:
+            seen = json.load(open(STATE))
+        except (OSError, ValueError):
+            seen = {}
+        found = findings(load(), now())
+        new = {n: s for n, s in found.items() if seen.get(seen_key(n, s)) != s["since"]}
+        if new:
+            seen.update({seen_key(n, s): s["since"] for n, s in new.items()})
+            os.makedirs(os.path.dirname(STATE), exist_ok=True)
+            json.dump(seen, open(STATE, "w"))
+            report(new)
+            return 0
+        time.sleep(60)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

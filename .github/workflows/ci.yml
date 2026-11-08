@@ -1,0 +1,27 @@
+name: CI
+
+# The guard's tests format dates with BSD date, so they run on a macOS runner.
+# The pane's tests need the claude CLI and run locally (make check).
+# Documentation-only pushes skip the run, and a superseded run is cancelled.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tests
+        run: make test

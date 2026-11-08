@@ -1,0 +1,22 @@
+{
+  "name": "task-queue",
+  "owner": {
+    "name": "Andrew Khabirov",
+    "url": "https://github.com/Tigeneric"
+  },
+  "metadata": {
+    "description": "A live task-queue pane for a Claude Code session, which also follows the sessions it hands tasks to, and a guard against re-writing an expired prompt cache"
+  },
+  "plugins": [
+    {
+      "name": "task-queue",
+      "source": "./plugins/task-queue",
+      "description": "A live pane with the session's task queue and open questions, kept by Claude; for tasks handed to other sessions, their context fill, idle time and /compact readiness"
+    },
+    {
+      "name": "stale-cache-guard",
+      "source": "./plugins/stale-cache-guard",
+      "description": "Hooks that stop a prompt or a SendMessage from re-writing a large context whose prompt cache has expired, unless the owner allows it"
+    }
+  ]
+}
