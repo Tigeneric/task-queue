@@ -130,13 +130,15 @@ err=$(printf '{"session_id":"s-cold","transcript_path":"%s","prompt":"again"}' "
 rm -f "$GUARD_STATE"/s-cold "$GUARD_STATE"/woken-*
 
 # --- language: English by default, Russian under the plugin's language option ---
-CYR='[А-Яа-яЁё]'
+# Cyrillic by code point: grep's [А-я] compares bytes in the C locale a CI runner has, and the
+# bytes of ⏸ and ≈ in the English text fall inside that range.
+has_cyrillic() { python3 -I -c 'import re, sys; sys.exit(0 if re.search("[\u0400-\u04ff]", sys.stdin.buffer.read().decode("utf-8")) else 1)'; }
 err=$(printf '{"session_id":"lang-en","transcript_path":"%s","prompt":"p"}' "$big" | GUARD_NOW=$((T0+7200)) python3 -I "$GUARD" 2>&1 >/dev/null)
-case "$err" in "⏸ This session's cache has expired"*) printf '%s' "$err" | grep -q "$CYR" && { echo "FAIL block-en-has-russian"; fails=$((fails+1)); } || echo "ok   block-en";; *) echo "FAIL block-en: $err"; fails=$((fails+1));; esac
+case "$err" in "⏸ This session's cache has expired"*) printf '%s' "$err" | has_cyrillic && { echo "FAIL block-en-has-russian"; fails=$((fails+1)); } || echo "ok   block-en";; *) echo "FAIL block-en: $err"; fails=$((fails+1));; esac
 err=$(printf '{"session_id":"lang-ru","transcript_path":"%s","prompt":"p"}' "$big" | CLAUDE_PLUGIN_OPTION_LANGUAGE=ru GUARD_NOW=$((T0+7200)) python3 -I "$GUARD" 2>&1 >/dev/null)
 case "$err" in "⏸ Кеш этой сессии истёк"*) echo "ok   block-ru";; *) echo "FAIL block-ru: $err"; fails=$((fails+1));; esac
 out=$(printf '{"session_id":"me","transcript_path":"%s","tool_name":"SendMessage","tool_input":{"to":"Warmy","message":"x"}}' "$sender" | GUARD_NOW=$((T0+11000)) python3 -I "$GUARD" 2>/dev/null)
-case "$out" in *"its cache has expired"*) printf '%s' "$out" | grep -q "$CYR" && { echo "FAIL deny-en-has-russian"; fails=$((fails+1)); } || echo "ok   deny-en";; *) echo "FAIL deny-en: $out"; fails=$((fails+1));; esac
+case "$out" in *"its cache has expired"*) printf '%s' "$out" | has_cyrillic && { echo "FAIL deny-en-has-russian"; fails=$((fails+1)); } || echo "ok   deny-en";; *) echo "FAIL deny-en: $out"; fails=$((fails+1));; esac
 out=$(printf '{"session_id":"me","transcript_path":"%s","tool_name":"SendMessage","tool_input":{"to":"Warmy","message":"x"}}' "$sender" | CLAUDE_PLUGIN_OPTION_LANGUAGE=ru GUARD_NOW=$((T0+11000)) python3 -I "$GUARD" 2>/dev/null)
 case "$out" in *"кеш истёк"*) echo "ok   deny-ru";; *) echo "FAIL deny-ru: $out"; fails=$((fails+1));; esac
 

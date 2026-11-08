@@ -4,6 +4,14 @@ Versions follow [semantic versioning](https://semver.org). Both plugins share on
 their `plugin.json` and in the git tag; a release is a section here, the version in both manifests
 and `git tag vX.Y.Z`.
 
+## 0.4.1 — 2026-11-08
+
+### stale-cache-guard
+
+- The language test finds Cyrillic by code point. It used `grep '[А-я]'`, which in the C locale of
+  a CI runner compares bytes and took `⏸` and `≈` in the English messages for Russian, so the first
+  CI run failed. The plugins themselves are unchanged.
+
 ## 0.4.0 — 2026-11-08
 
 The first public release; versions before 0.4.0 were used privately and never published.
