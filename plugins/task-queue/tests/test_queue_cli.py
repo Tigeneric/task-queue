@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+import importlib.util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -420,11 +421,35 @@ class SessionNames(unittest.TestCase):
             self.assertIs(json.loads(out.stdout)["Mary Ann"].get("stalled"), True, out.stdout)
 
 
+class NoLoadModule(unittest.TestCase):
+    """Python 3.15 removed SourceFileLoader.load_module, and the CLIs load bin/stalls by path."""
+
+    LOADERS = ("queue", "contexts", "compactready")
+
+    def sources(self):
+        files = [p for p in (MOD / "bin").iterdir() if p.is_file()] + list((MOD / "tests").glob("*.py"))
+        self.assertGreater(len(files), 10, "the walk found the plugin's sources")
+        # Code only: a comment or this docstring may name the removed method.
+        return {f: "\n".join(line.split("#", 1)[0] for line in f.read_text().splitlines()) for f in files}
+
+    def test_no_source_calls_load_module(self):
+        call = ".load" + "_module("  # split, so this line is not a match of its own
+        calls = [f.name for f, code in self.sources().items() if call in code]
+        self.assertEqual(calls, [])
+
+    def test_every_cli_that_loads_stalls_runs_it_through_exec_module(self):
+        for name in self.LOADERS:
+            code = (MOD / "bin" / name).read_text()
+            self.assertTrue('"stalls"' in code and "exec_module(" in code, name)
+
+
 class OwnerWords(unittest.TestCase):
     """bin/stalls reads a session owner in either language, whatever the pane's language."""
 
     def test_session_name_reads_both_languages(self):
-        stalls = SourceFileLoader("stalls_words", str(MOD / "bin" / "stalls")).load_module()
+        loader = SourceFileLoader("stalls_words", str(MOD / "bin" / "stalls"))
+        stalls = importlib.util.module_from_spec(importlib.util.spec_from_loader("stalls_words", loader))
+        loader.exec_module(stalls)
         self.assertEqual(stalls.session_name("сессия Ada🎻"), "Ada")
         self.assertEqual(stalls.session_name("session Ada🎻"), "Ada")
         self.assertEqual(stalls.session_name("Session O'Brien"), "O'Brien")

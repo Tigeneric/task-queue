@@ -7,6 +7,7 @@ cache written). The window is taken as 1,000,000 tokens (the 1M models every ses
 runs); a session past 200,000 cannot be on a 200k window, so the guess never under-reads.
 """
 import json, os, re, sys, glob, subprocess
+import importlib.util
 from importlib.machinery import SourceFileLoader
 
 HOME = os.path.expanduser("~")
@@ -31,12 +32,20 @@ def find_guard():
     return None
 
 
+def load_script(name, path):
+    """Load a sibling script that has no .py suffix (SourceFileLoader.load_module is gone in Python 3.15)."""
+    loader = SourceFileLoader(name, path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(module)
+    return module
+
+
 GUARD = find_guard()
 if "--guard" in sys.argv:
     print(GUARD or "", end="\n" if GUARD else "")
     sys.exit(0 if GUARD else 1)
 # bin/stalls holds the stall rule and the one rule for a session's bare name.
-STALLS = SourceFileLoader("stalls", os.path.join(os.path.dirname(os.path.realpath(__file__)), "stalls")).load_module()
+STALLS = load_script("stalls", os.path.join(os.path.dirname(os.path.realpath(__file__)), "stalls"))
 
 
 def queue_names():

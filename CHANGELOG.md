@@ -4,6 +4,14 @@ Versions follow [semantic versioning](https://semver.org). Both plugins share on
 their `plugin.json` and in the git tag; a release is a section here, the version in both manifests
 and `git tag vX.Y.Z`.
 
+## 0.4.2 — 2026-11-08
+
+### task-queue
+
+- Works on Python 3.15. `bin/queue`, `bin/contexts` and `bin/compactready` loaded `bin/stalls`
+  with `SourceFileLoader.load_module`, which Python 3.15 removed, so the queue CLI and the pane's
+  context reader failed at start.
+
 ## 0.4.1 — 2026-11-08
 
 ### stale-cache-guard

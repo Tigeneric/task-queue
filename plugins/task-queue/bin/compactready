@@ -16,11 +16,20 @@ import argparse
 import json
 import os
 import sys
+import importlib.util
 from importlib.machinery import SourceFileLoader
+
+def load_script(name, path):
+    """Load a sibling script that has no .py suffix (SourceFileLoader.load_module is gone in Python 3.15)."""
+    loader = SourceFileLoader(name, path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(module)
+    return module
+
 
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.realpath(__file__))
-STALLS = SourceFileLoader("stalls", os.path.join(HERE, "stalls")).load_module()
+STALLS = load_script("stalls", os.path.join(HERE, "stalls"))
 WINDOW = int(os.environ.get("QUEUE_CONTEXT_WINDOW", "1000000"))
 COMPACT_AT = 80
 NUDGE_STEP = 5

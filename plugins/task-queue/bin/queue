@@ -24,6 +24,7 @@ import os
 import sys
 import tempfile
 import time
+import importlib.util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -32,8 +33,16 @@ STATUSES = sorted(set(VERBS.values()))
 CLEARABLE = ("phase", "note", "purpose")
 
 
+def load_script(name, path):
+    """Load a sibling script that has no .py suffix (SourceFileLoader.load_module is gone in Python 3.15)."""
+    loader = SourceFileLoader(name, path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(module)
+    return module
+
+
 # bin/stalls holds the one rule for a session's bare name, the key the pane and contexts use.
-STALLS = SourceFileLoader("stalls", os.path.join(os.path.dirname(os.path.realpath(__file__)), "stalls")).load_module()
+STALLS = load_script("stalls", os.path.join(os.path.dirname(os.path.realpath(__file__)), "stalls"))
 
 
 # The words the CLI writes for the person, by the plugin's `language` option (--lang). Owner

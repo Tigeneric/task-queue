@@ -57,8 +57,9 @@ class MovedSession(unittest.TestCase):
         self.assertEqual(json.loads(r.stdout).get("Mover", {}).get("tokens"), 500_000, r.stderr)
 
     def test_stalls_points_at_the_transcript(self):
-        code = "import sys; from importlib.machinery import SourceFileLoader as L; " \
-               "print(L('stalls', sys.argv[1]).load_module().sessions()['Mover'])"
+        code = ("import sys, importlib.util; from importlib.machinery import SourceFileLoader as L; "
+                "l = L('stalls', sys.argv[1]); m = importlib.util.module_from_spec(importlib.util.spec_from_loader('stalls', l)); "
+                "l.exec_module(m); print(m.sessions()['Mover'])")
         r = subprocess.run([sys.executable, "-I", "-c", code, str(STALLS)], capture_output=True, text=True,
                            env=self.env())
         self.assertEqual(r.stdout.strip(), str(self.transcript), r.stderr)
